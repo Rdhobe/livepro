@@ -3,6 +3,7 @@ import json
 import queue
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import boto3
 import pyttsx3
@@ -11,7 +12,6 @@ from botocore.config import Config
 from vosk import KaldiRecognizer, Model
 
 from config import AWS_REGION, BEDROCK_MODEL_ID, VOSK_MODEL_PATH
-
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
@@ -97,11 +97,11 @@ class LocalVoskTranscriber:
         self.audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
 
     def audio_callback(self, indata, frames, time_info, status):
+        del frames, time_info
         if status:
             print(f"[audio warning] {status}")
-        chunk = bytes(indata)
         try:
-            self.audio_queue.put_nowait(chunk)
+            self.audio_queue.put_nowait(bytes(indata))
         except queue.Full:
             pass
 
@@ -117,6 +117,14 @@ class LocalVoskTranscriber:
                 text = result.get("text", "").strip()
                 if text:
                     yield text
+
+
+def validate_environment() -> None:
+    if not Path(VOSK_MODEL_PATH).exists():
+        raise FileNotFoundError(
+            f"VOSK model not found at '{VOSK_MODEL_PATH}'. "
+            "Download a model and update VOSK_MODEL_PATH in config.py."
+        )
 
 
 class LiveVoiceAssistant:
@@ -159,9 +167,8 @@ class LiveVoiceAssistant:
 
     async def run(self):
         print("Live voice assistant started. Speak naturally (Ctrl+C to exit).")
-        loop = asyncio.get_running_loop()
-
         transcript_iter = self.transcriber.listen_for_final_text(self.stop_event)
+
         with sd.RawInputStream(
             samplerate=AUDIO_SAMPLE_RATE,
             blocksize=AUDIO_BLOCK_SIZE,
@@ -176,6 +183,7 @@ class LiveVoiceAssistant:
 
 
 def main():
+    validate_environment()
     assistant = LiveVoiceAssistant(AssistantConfig())
     try:
         asyncio.run(assistant.run())
