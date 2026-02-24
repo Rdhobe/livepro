@@ -1,17 +1,17 @@
 import asyncio
 import json
-import queue
-import threading
 from dataclasses import dataclass
-from pathlib import Path
+from typing import AsyncIterator, Callable
 
 import boto3
-import pyttsx3
 import sounddevice as sd
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptEvent
 from botocore.config import Config
-from vosk import KaldiRecognizer, Model
 
-from config import AWS_REGION, BEDROCK_MODEL_ID, VOSK_MODEL_PATH
+from config import AWS_REGION, BEDROCK_MODEL_ID
+
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
@@ -27,7 +27,7 @@ class AssistantConfig:
     )
     temperature: float = 0.5
     max_gen_len: int = 300
-    speech_rate: int = 180
+    voice_id: str = "Joanna"
 
 
 class BedrockLlamaStreamer:
@@ -75,56 +75,40 @@ class BedrockLlamaStreamer:
                 yield token
 
 
-class LocalSpeaker:
-    def __init__(self, rate: int = 180):
-        self.engine = pyttsx3.init()
-        self.engine.setProperty("rate", rate)
-        self._lock = threading.Lock()
+class PollySpeaker:
+    def __init__(self, region: str, voice_id: str = "Joanna"):
+        self.voice_id = voice_id
+        self.client = boto3.client("polly", region_name=region)
 
     def speak(self, text: str):
         if not text.strip():
             return
-        with self._lock:
-            self.engine.say(text)
-            self.engine.runAndWait()
-
-
-class LocalVoskTranscriber:
-    def __init__(self, model_path: str):
-        self.model = Model(model_path)
-        self.recognizer = KaldiRecognizer(self.model, AUDIO_SAMPLE_RATE)
-        self.recognizer.SetWords(False)
-        self.audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
-
-    def audio_callback(self, indata, frames, time_info, status):
-        del frames, time_info
-        if status:
-            print(f"[audio warning] {status}")
-        try:
-            self.audio_queue.put_nowait(bytes(indata))
-        except queue.Full:
-            pass
-
-    def listen_for_final_text(self, stop_event: threading.Event):
-        while not stop_event.is_set():
-            try:
-                data = self.audio_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            if self.recognizer.AcceptWaveform(data):
-                result = json.loads(self.recognizer.Result())
-                text = result.get("text", "").strip()
-                if text:
-                    yield text
-
-
-def validate_environment() -> None:
-    if not Path(VOSK_MODEL_PATH).exists():
-        raise FileNotFoundError(
-            f"VOSK model not found at '{VOSK_MODEL_PATH}'. "
-            "Download a model and update VOSK_MODEL_PATH in config.py."
+        response = self.client.synthesize_speech(
+            Text=text,
+            OutputFormat="pcm",
+            VoiceId=self.voice_id,
+            SampleRate=str(AUDIO_SAMPLE_RATE),
+            Engine="neural",
         )
+        pcm_bytes = response["AudioStream"].read()
+        audio = memoryview(pcm_bytes).cast("h")
+        sd.play(audio, samplerate=AUDIO_SAMPLE_RATE)
+        sd.wait()
+
+
+class TranscriptHandler(TranscriptResultStreamHandler):
+    def __init__(self, output_stream, on_final_text: Callable[[str], asyncio.Future]):
+        super().__init__(output_stream)
+        self.on_final_text = on_final_text
+
+    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+        for result in transcript_event.transcript.results:
+            if result.is_partial:
+                continue
+            for alt in result.alternatives:
+                text = alt.transcript.strip()
+                if text:
+                    await self.on_final_text(text)
 
 
 class LiveVoiceAssistant:
@@ -132,11 +116,29 @@ class LiveVoiceAssistant:
         self.config = config
         self.messages: list[dict] = []
         self.bedrock = BedrockLlamaStreamer(AWS_REGION, BEDROCK_MODEL_ID)
-        self.speaker = LocalSpeaker(rate=config.speech_rate)
-        self.transcriber = LocalVoskTranscriber(VOSK_MODEL_PATH)
-        self.stop_event = threading.Event()
+        self.speaker = PollySpeaker(AWS_REGION, config.voice_id)
+        self.transcribe = TranscribeStreamingClient(region=AWS_REGION)
+        self.audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        self.stop_event = asyncio.Event()
 
-    async def _handle_user_text(self, text: str):
+    def _audio_callback(self, indata, frames, time, status):
+        if status:
+            print(f"[audio warning] {status}")
+        chunk = bytes(indata)
+        try:
+            self.audio_queue.put_nowait(chunk)
+        except asyncio.QueueFull:
+            pass
+
+    async def _write_mic_audio(self, input_stream):
+        while not self.stop_event.is_set():
+            chunk = await self.audio_queue.get()
+            await input_stream.send_audio_event(audio_chunk=chunk)
+        await input_stream.end_stream()
+
+    async def _on_user_text(self, text: str):
+        if not text:
+            return
         print(f"\n🧑 {text}")
         self.messages.append({"role": "user", "content": text})
 
@@ -155,9 +157,9 @@ class LiveVoiceAssistant:
             sentence_buffer += token
 
             if any(sentence_buffer.endswith(p) for p in (".", "?", "!", "\n")):
-                segment = sentence_buffer.strip()
+                to_speak = sentence_buffer.strip()
                 sentence_buffer = ""
-                await asyncio.to_thread(self.speaker.speak, segment)
+                await asyncio.to_thread(self.speaker.speak, to_speak)
 
         if sentence_buffer.strip():
             await asyncio.to_thread(self.speaker.speak, sentence_buffer.strip())
@@ -167,30 +169,35 @@ class LiveVoiceAssistant:
 
     async def run(self):
         print("Live voice assistant started. Speak naturally (Ctrl+C to exit).")
-        transcript_iter = self.transcriber.listen_for_final_text(self.stop_event)
+        stream = await self.transcribe.start_stream_transcription(
+            language_code="en-US",
+            media_sample_rate_hz=AUDIO_SAMPLE_RATE,
+            media_encoding="pcm",
+        )
+
+        handler = TranscriptHandler(stream.output_stream, self._on_user_text)
 
         with sd.RawInputStream(
             samplerate=AUDIO_SAMPLE_RATE,
             blocksize=AUDIO_BLOCK_SIZE,
             dtype="int16",
             channels=AUDIO_CHANNELS,
-            callback=self.transcriber.audio_callback,
+            callback=self._audio_callback,
         ):
-            while not self.stop_event.is_set():
-                text = await asyncio.to_thread(lambda: next(transcript_iter, None))
-                if text:
-                    await self._handle_user_text(text)
+            await asyncio.gather(
+                self._write_mic_audio(stream.input_stream),
+                handler.handle_events(),
+            )
 
 
-def main():
-    validate_environment()
+async def main():
     assistant = LiveVoiceAssistant(AssistantConfig())
     try:
-        asyncio.run(assistant.run())
+        await assistant.run()
     except KeyboardInterrupt:
         assistant.stop_event.set()
         print("\nStopped.")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
